@@ -1,0 +1,4 @@
+ root :: INFO     :: scan ::Starting Scan
+ urllib3.connectionpool :: DEBUG    :: _new_conn ::Starting new HTTPS connection (1): api.resy.com:443
+ urllib3.connectionpool :: DEBUG    :: _make_request ::https://api.resy.com:443 "POST /3/auth/password HTTP/1.1" 500 21
+ root :: ERROR    :: snipe ::('Internal Server Error', 500)

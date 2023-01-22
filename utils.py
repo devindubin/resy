@@ -6,6 +6,10 @@ import requests
 import datetime
 from urllib.parse import urljoin, quote
 import pandas as pd
+import logging
+#import time
+
+logging.basicConfig(filename='resy.log',level=logging.DEBUG,format=' %(name)s :: %(levelname)-8s :: %(funcName)s ::%(message)s',filemode='w')
 
 # TODO: Clean up argument defaults
 
@@ -43,7 +47,7 @@ def authenticate(*args, **kwargs):
             required_header.update(xResyAuthToken)
             return {"header": required_header}
         else:
-            raise Exception(response.json())
+            raise Exception((response.text,response.status_code))
 
 
 def auth(func):
@@ -92,7 +96,7 @@ def get_venues(
 def get_details(config_id=None, day=None, party_size=None, *args, **kwargs):
     params = {"config_id": config_id, "day": day.strftime("%Y-%m-%d"), "party_size": party_size}
     required_headers = kwargs.get("authheader")
-    print(params)
+    logging.info(params)
     with requests.Session() as s:
         url = urljoin(BASE_URL, "/3/details")
         s.headers.update(required_headers.get("header"))
@@ -175,13 +179,20 @@ def snipe(
     dateTime: datetime.datetime = None,
     party_size: int
      = None,
+    allowed_types: list = ['Private','Communal'],
+    confirmation = True
 ):
+    FOUND = False
+    BOOKED = False
+    BOOKEDDETAILS = {}
+    notif_for_scan = {'found':FOUND,'booked':BOOKED, 'details': BOOKEDDETAILS,'reservation_details':{}}
     try:
         #day = dateTime.strftime("%Y-%m-%d")
         output = get_venues(venue_id=venue_id, day=dateTime)
         venues = output.get('data').get('results').get('venues')
     except Exception as e:
-        print("Error finding venue", e)
+        logging.error(e)
+        raise e
 
     out = []
     for venue in venues:
@@ -226,7 +237,7 @@ def snipe(
                 [
                     slots_df_3,
                     slots_df_3["size"].apply(
-                        lambda x: pd.Series(x).add_prefix("size_")
+                        lambda x: pd.Series(x,dtype=int).add_prefix("size_")
                     ),
                 ],
                 axis=1,
@@ -246,7 +257,8 @@ def snipe(
 
     place = out.pop()
     slots = place.get('slots')
-    if slots:
+    
+    if not slots.empty:
         slots["date_start"] = pd.to_datetime(slots["date_start"])
         print(dateTime + datetime.timedelta(minutes=-30))
         print(dateTime + datetime.timedelta(minutes=30))
@@ -256,39 +268,84 @@ def snipe(
             & (
                 (slots["date_start"] >= dateTime + datetime.timedelta(minutes=-30))
                 & (slots["date_start"] <= dateTime + datetime.timedelta(minutes=30))
+            ) & (
+                slots['config_type'].isin(allowed_types)
             )
         ]
     else:
-        print('No avaialble slots')
-        return
+        logging.info('No slots found')
+        return notif_for_scan
+
     valid_slots=valid_slots.reset_index(drop=True)
-    if len(valid_slots) > 1:
+    print(len(valid_slots))
+    if len(valid_slots) >= 1:
         #Take first valid configuration
         reservation = valid_slots.loc[0]
+        notif_for_scan['found'] = True
     else:
-        reservation = valid_slots
+        logging.info("No Slots Meet Criteria")
+        logging.info(slots.to_string())
+        reservation = None
+        return notif_for_scan
 
+    print(FOUND)
+    print(notif_for_scan)
     config_token = reservation.get('config_token')
 
     details = get_details(config_id=config_token,day=dateTime,party_size=party_size)
 
-    book_token = details.get('data').get('book_token')
-    print(book_token)
-    res = input("Proceed with booking? y/N")
+    
+
+    detail_data = details.get('data')
+    book_token = detail_data.get('book_token')
+    
+    print(detail_data.get('cancellation').get('display').get('policy'))
+    if confirmation:
+        res = input("Proceed with booking? y/N")
+    else:
+        res = 'y'
     if res.lower()[0] == 'y':
-        booked_details = book_reservation(book_token=book_token.get('value'))
+        try:
+            booked_details = book_reservation(book_token=book_token.get('value'))
+            notif_for_scan["booked"] = True
+            notif_for_scan["reservation_details"] = booked_details
+            notif_for_scan['details'] = detail_data
+            
+        except Exception as e:
+            logging.error('Booking Failed')
+            return notif_for_scan
     else:
-        print("Job Cancelled")
-        return 
+        logging.info('Booking cancelled')
+        return notif_for_scan
+    logging.info('Booking Successful')
+    return notif_for_scan
 
-    return booked_details
+def scan(venue_id: str = None,party_size:int = 2,day= NOW,allowed_types=['Private','Communal','The Bar Room'],confirmation=True,max_attempts=None, delay = 1):
+    logging.info('Starting Scan')
+    TRY_AGAIN = True
+    if max_attempts:
+        i = 0
+    while TRY_AGAIN:
+        notif_for_scan = snipe(venue_id=venue_id,dateTime=day,party_size=party_size,allowed_types=allowed_types,confirmation=confirmation)
+        print(notif_for_scan)
+        if notif_for_scan.get('found'):
+            TRY_AGAIN = False
+            if notif_for_scan.get('booked'):
+                logging.info('Reservation booked!')
+                logging.info(notif_for_scan.get('details'))
+                return {'retry':TRY_AGAIN,'details': notif_for_scan}
+            else:
+                logging.info('Error booking reservation, scanning stopped. Please check logs')
+                return {'retry':TRY_AGAIN,'details': notif_for_scan}
+        else:
+            if i == max_attempts - 1:
+                logging.info('Hit max attempts, shutting down')
+                TRY_AGAIN = False
+                return 
+            print('Nothing Found, Trying Again')
+            logging.info('Nothing Found. Trying again')
+            logging.info({'retry':TRY_AGAIN,'details':notif_for_scan})
+            i += 1
+            time.sleep(delay*60)
+            continue
 
-def scan(venue_id: str = None,party_size:int = 2,day= NOW):
-    venues = get_venues(venue_id=venue_id,party_size=party_size,day=day)
-    #print(venues.get('data').get('results').get('venues')[0].get('slots'))
-    slots=venues.get('data').get('results').get('venues')[0].get('slots')
-
-    if slots:
-        return "Reservations Available"
-    else:
-        return "No Reservations Available"
